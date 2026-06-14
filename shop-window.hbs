@@ -1,0 +1,120 @@
+/**
+ * RPGX Shops & Traders — Socket Relay
+ * ─────────────────────────────────────────────────────────────────────────
+ * Players normally can't edit a GM-owned business actor directly (they have
+ * no ownership of it), so a purchase or sale has to be carried out by a GM
+ * client on their behalf. This mirrors the relay pattern used elsewhere in
+ * the RPGX Toolbelt: the player emits a request over game.socket, the active
+ * GM's client runs processTransaction() (which has full permissions), and
+ * sends the result back.
+ *
+ * If the requesting user IS a GM (testing the shop themselves), the request
+ * runs locally with no socket round trip at all.
+ */
+
+import { MODULE_ID } from "./currency.js";
+import { processTransaction } from "./shop.js";
+
+const SOCKET_EVENT = `module.${MODULE_ID}`;
+const RESPONSE_TIMEOUT_MS = 15000;
+
+/** Register the GM-side listener. Call once, from the ready hook. */
+export function registerSocketHandlers() {
+  game.socket.on(SOCKET_EVENT, async message => {
+    if (!game.user.isGM) return;
+
+    if (message?.type === "TRANSACTION_REQUEST") {
+      if (!isLeadGM()) return; // only one GM client should act on this
+
+      const { requestId, userId, payload } = message;
+
+      try {
+        const result = await processTransaction(payload);
+        game.socket.emit(SOCKET_EVENT, { type: "TRANSACTION_RESULT", requestId, userId, success: true, result });
+      } catch (err) {
+        game.socket.emit(SOCKET_EVENT, { type: "TRANSACTION_RESULT", requestId, userId, success: false, error: err.message });
+      }
+      return;
+    }
+
+    if (message?.type === "HAGGLE_REQUEST") {
+      // Every active GM client gets the heads-up, not just the lead, this
+      // is just a notification, there's nothing to coordinate.
+      ui.notifications.info(`${message.shopperName} wishes to haggle at ${message.businessName}.`);
+    }
+  });
+}
+
+/** Deterministically picks one active GM to avoid every GM client double-processing the same request. */
+function isLeadGM() {
+  const activeGMs = game.users.filter(u => u.isGM && u.active).sort((a, b) => a.id.localeCompare(b.id));
+  return activeGMs[0]?.id === game.user.id;
+}
+
+/**
+ * Run a shop transaction. GMs run it directly (no socket needed).
+ * Players send it to an active GM client and wait for the result.
+ *
+ * @throws if no GM is online, the GM doesn't respond in time, or the
+ *         transaction itself fails (insufficient funds, etc.)
+ */
+export async function requestTransaction(payload) {
+  if (game.user.isGM) {
+    return processTransaction(payload);
+  }
+
+  if (!game.users.some(u => u.isGM && u.active)) {
+    throw new Error("No GM is currently online to process this. Try again when a GM is available.");
+  }
+
+  const requestId = foundry.utils.randomID();
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      game.socket.off(SOCKET_EVENT, listener);
+      reject(new Error("The GM's client didn't respond in time. Try again."));
+    }, RESPONSE_TIMEOUT_MS);
+
+    function listener(message) {
+      if (message?.type !== "TRANSACTION_RESULT") return;
+      if (message.requestId !== requestId || message.userId !== game.user.id) return;
+
+      clearTimeout(timeout);
+      game.socket.off(SOCKET_EVENT, listener);
+
+      if (message.success) resolve(message.result);
+      else reject(new Error(message.error || "Transaction failed."));
+    }
+
+    game.socket.on(SOCKET_EVENT, listener);
+    game.socket.emit(SOCKET_EVENT, { type: "TRANSACTION_REQUEST", requestId, userId: game.user.id, payload });
+  });
+}
+
+/**
+ * Let the GM know someone wants to haggle, without interrupting whatever
+ * they're doing more than necessary. Posts a whispered chat card (a
+ * persistent cue they can act on whenever they have a moment) and, for
+ * players, pushes an immediate toast notification to any active GM client
+ * in case they're not looking at the chat log.
+ */
+export async function requestHaggle({ businessName, shopperName, shopperActorId }) {
+  const speaker = shopperActorId
+    ? ChatMessage.getSpeaker({ actor: game.actors.get(shopperActorId) })
+    : ChatMessage.getSpeaker();
+
+  await ChatMessage.create({
+    content: `<p><i class="fa-solid fa-comments-dollar"></i> <strong>${shopperName}</strong> wishes to haggle at <strong>${businessName}</strong>. Call for a Persuasion (or similar) check when you have a moment!</p>`,
+    whisper: ChatMessage.getWhisperRecipients("GM").map(u => u.id),
+    speaker
+  });
+
+  if (game.user.isGM) {
+    ui.notifications.info(`${shopperName} wishes to haggle at ${businessName}.`);
+    return;
+  }
+
+  if (game.users.some(u => u.isGM && u.active)) {
+    game.socket.emit(SOCKET_EVENT, { type: "HAGGLE_REQUEST", shopperName, businessName });
+  }
+}

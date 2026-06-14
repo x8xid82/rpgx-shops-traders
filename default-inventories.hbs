@@ -1,0 +1,353 @@
+import { MODULE_ID, CURRENCY_PRESETS } from "./currency.js";
+import { ShopsMainMenu } from "./apps/main-menu.js";
+import { DefaultInventoriesApp } from "./apps/default-inventories.js";
+import { ShopWindowSheet } from "./apps/shop-window.js";
+import { refreshProtonStatus } from "./ai.js";
+import { registerSocketHandlers } from "./socket.js";
+import { BUSINESS_FLAG, ITEM_RESTOCK_FLAG, getAllBusinesses, ensureShopSheet } from "./business.js";
+
+const BUG_REPORT_URL = "https://discord.gg/BAXavrCxyT";
+
+Hooks.once("init", () => {
+  // Register the Shop window as a sheet option for "npc"-type actors.
+  // It's never the *default* NPC sheet, only businesses get pointed at it
+  // (via the core.sheetClass flag, set in business.js), so regular NPCs
+  // keep using their normal system sheet untouched.
+  Actors.registerSheet(MODULE_ID, ShopWindowSheet, {
+    types: ["npc"],
+    makeDefault: false,
+    label: "RPGX Shop & Trader Window"
+  });
+
+  // --- Header / version display ---
+  // Foundry renders this setting's name+hint as a normal row, we hide just
+  // the input (see enhanceShopsSettings) so the row becomes a header card.
+
+  game.settings.register(MODULE_ID, "_moduleInfo", {
+    name: `RPGX Shops & Traders (v${game.modules.get(MODULE_ID)?.version ?? "?"})`,
+    hint: "Interactive shops and traders for your players, with live inventory, haggling, and AI-assisted shop generation. rpgxstudios.com",
+    scope: "world",
+    config: true,
+    type: String,
+    default: "",
+    onChange: () => {}
+  });
+
+  // --- RPGX Proton connection ---
+
+  game.settings.register(MODULE_ID, "ragBase", {
+    name: "RPGX-SHOPS.Settings.ProtonUrl.Name",
+    hint: "RPGX-SHOPS.Settings.ProtonUrl.Hint",
+    scope: "world",
+    config: true,
+    type: String,
+    default: "http://127.0.0.1:3033"
+  });
+
+  game.settings.register(MODULE_ID, "protonToken", {
+    name: "RPGX-SHOPS.Settings.ProtonToken.Name",
+    hint: "RPGX-SHOPS.Settings.ProtonToken.Hint",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
+
+  // --- Game System & Genre, free text, standalone ---
+
+  game.settings.register(MODULE_ID, "gameSystem", {
+    name: "RPGX-SHOPS.Settings.GameSystem.Name",
+    hint: "RPGX-SHOPS.Settings.GameSystem.Hint",
+    scope: "world",
+    config: true,
+    type: String,
+    default: "D&D 5E (2024)"
+  });
+
+  game.settings.register(MODULE_ID, "genre", {
+    name: "RPGX-SHOPS.Settings.Genre.Name",
+    hint: "RPGX-SHOPS.Settings.Genre.Hint",
+    scope: "world",
+    config: true,
+    type: String,
+    default: "Fantasy"
+  });
+
+  // --- AI model ---
+  // Stores the literal Ollama model name (e.g. "phi4"). The settings page
+  // overlays a tier dropdown + custom field on top of this text input.
+
+  game.settings.register(MODULE_ID, "ollamaModel", {
+    name: "RPGX-SHOPS.Settings.OllamaModel.Name",
+    hint: "RPGX-SHOPS.Settings.OllamaModel.Hint",
+    scope: "world",
+    config: true,
+    type: String,
+    default: "phi4"
+  });
+
+  game.settings.register(MODULE_ID, "aiTimeout", {
+    name: "RPGX-SHOPS.Settings.AITimeout.Name",
+    hint: "RPGX-SHOPS.Settings.AITimeout.Hint",
+    scope: "world",
+    config: true,
+    type: Number,
+    range: { min: 30, max: 600, step: 30 },
+    default: 300
+  });
+
+  game.settings.register(MODULE_ID, "aiTemperature", {
+    name: "RPGX-SHOPS.Settings.AICreativity.Name",
+    hint: "RPGX-SHOPS.Settings.AICreativity.Hint",
+    scope: "world",
+    config: true,
+    type: Number,
+    range: { min: 0.5, max: 1.5, step: 0.1 },
+    default: 1.2
+  });
+
+  // --- Shop behavior ---
+
+  game.settings.register(MODULE_ID, "defaultBuybackRate", {
+    name: "RPGX-SHOPS.Settings.BuybackRate.Name",
+    hint: "RPGX-SHOPS.Settings.BuybackRate.Hint",
+    scope: "world",
+    config: true,
+    type: Number,
+    default: 75,
+    range: { min: 0, max: 100, step: 5 }
+  });
+
+  game.settings.register(MODULE_ID, "autoApproveSessions", {
+    name: "RPGX-SHOPS.Settings.AutoApprove.Name",
+    hint: "RPGX-SHOPS.Settings.AutoApprove.Hint",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: false
+  });
+
+  // --- Default inventory lists ---
+
+  game.settings.registerMenu(MODULE_ID, "defaultInventoriesMenu", {
+    name: "RPGX-SHOPS.Settings.DefaultInventories.Name",
+    label: "RPGX-SHOPS.Settings.DefaultInventories.Label",
+    hint: "RPGX-SHOPS.Settings.DefaultInventories.Hint",
+    icon: "fa-solid fa-boxes-stacked",
+    type: DefaultInventoriesApp,
+    restricted: true
+  });
+
+  game.settings.register(MODULE_ID, "defaultInventoryLists", {
+    scope: "world",
+    config: false,
+    type: Array,
+    default: []
+  });
+
+  // --- Currency (internal data, editor lands with the Shop window) ---
+
+  game.settings.register(MODULE_ID, "currencyConfig", {
+    scope: "world",
+    config: false,
+    type: Array,
+    default: CURRENCY_PRESETS.dnd5e
+  });
+});
+
+Hooks.once("ready", () => {
+  // Macro-friendly API: game.modules.get("rpgx-shops-traders").api.openMainMenu()
+  game.modules.get(MODULE_ID).api = {
+    openMainMenu: () => new ShopsMainMenu().render(true)
+  };
+
+  // Everyone gets the floating button now, it's the players' entry point into
+  // the shop browser. GM-only controls (New Business, Edit, Delete) are
+  // already hidden in the main menu template, players just see "Open".
+  createFloatingButton();
+
+  registerSocketHandlers();
+
+  // Existing businesses (created before token-click support existed) won't
+  // have their sheet pointed at the Shop window yet, fix that up once here.
+  // New businesses get this set automatically in createBusiness().
+  if (game.user.isGM) {
+    for (const business of getAllBusinesses()) {
+      ensureShopSheet(business);
+    }
+  }
+
+  // Populate the cached Proton status so the AI Generate panel can show
+  // the right state the first time a GM opens a business.
+  refreshProtonStatus();
+});
+
+// When an item is first dropped onto a business actor, snapshot its starting
+// quantity as the "restock" baseline (used by the Restock All button). Only
+// the GM writes this, since players don't have permission to set flags on a
+// GM-owned business actor, the value then syncs to everyone normally.
+Hooks.on("createItem", async (item, _options, _userId) => {
+  if (!game.user.isGM) return;
+  if (!item.parent?.getFlag(MODULE_ID, BUSINESS_FLAG)) return;
+  if (item.getFlag(MODULE_ID, ITEM_RESTOCK_FLAG) !== undefined) return;
+  await item.setFlag(MODULE_ID, ITEM_RESTOCK_FLAG, item.system.quantity ?? 0);
+});
+
+/* -------------------------------------------- */
+/* AI Model Tier dropdown enhancement            */
+/* -------------------------------------------- */
+/* Transforms the hidden ollamaModel text input into a tier dropdown with  */
+/* a custom option, mirroring RPGX AI Assistant / Quest Log exactly.       */
+
+const MODEL_TIERS = [
+  { label: "Lite (phi4-mini)", value: "phi4-mini" },
+  { label: "Standard (phi4) ⭐", value: "phi4" },
+  { label: "Enhanced (phi4-reasoning)", value: "phi4-reasoning" },
+  { label: "Ultra (phi4-reasoning:plus)", value: "phi4-reasoning:plus" }
+];
+
+function enhanceModelInput(input) {
+  if (!input || input.dataset.rpgxEnhanced) return;
+  input.dataset.rpgxEnhanced = "true";
+
+  const currentVal = input.value || "phi4";
+  const isCustom = !MODEL_TIERS.some(t => t.value === currentVal);
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "rpgx-model-combo";
+
+  const select = document.createElement("select");
+  select.className = "rpgx-model-select";
+
+  for (const tier of MODEL_TIERS) {
+    const opt = document.createElement("option");
+    opt.value = tier.value;
+    opt.textContent = tier.label;
+    if (tier.value === currentVal) opt.selected = true;
+    select.appendChild(opt);
+  }
+
+  const customOpt = document.createElement("option");
+  customOpt.value = "__custom__";
+  customOpt.textContent = "Custom...";
+  if (isCustom) customOpt.selected = true;
+  select.appendChild(customOpt);
+
+  const custom = document.createElement("input");
+  custom.type = "text";
+  custom.className = "rpgx-model-custom";
+  custom.placeholder = "Enter model name (e.g. llama3, mistral:7b)";
+  custom.value = isCustom ? currentVal : "";
+  custom.style.display = isCustom ? "block" : "none";
+
+  wrapper.appendChild(select);
+  wrapper.appendChild(custom);
+  input.style.display = "none";
+  input.parentNode.insertBefore(wrapper, input.nextSibling);
+
+  select.addEventListener("change", () => {
+    if (select.value === "__custom__") {
+      custom.style.display = "block";
+      custom.focus();
+      input.value = custom.value;
+    } else {
+      custom.style.display = "none";
+      input.value = select.value;
+    }
+    input.dispatchEvent(new Event("change"));
+  });
+
+  custom.addEventListener("input", () => {
+    input.value = custom.value;
+    input.dispatchEvent(new Event("change"));
+  });
+}
+
+/* -------------------------------------------- */
+/* Settings page extras (mirrors Quest Log)      */
+/* -------------------------------------------- */
+
+function enhanceShopsSettings(root) {
+  // 1. Model tier dropdown
+  const modelInput = root.querySelector(`[name="${MODULE_ID}.ollamaModel"]`);
+  if (modelInput) enhanceModelInput(modelInput);
+
+  // 2. Hide only the input side of the _moduleInfo row, leaving the
+  //    name and hint text visible as a header card.
+  const infoInput = root.querySelector(`[name="${MODULE_ID}._moduleInfo"]`);
+  if (infoInput) {
+    const formFields = infoInput.closest(".form-fields") ?? infoInput.parentElement;
+    if (formFields) formFields.style.display = "none";
+  }
+
+  // 3. Report Bug button, injected next to the _moduleInfo row
+  const infoGroup = root.querySelector(`[name="${MODULE_ID}._moduleInfo"]`)?.closest(".form-group");
+  if (infoGroup && !infoGroup.querySelector(".rpgx-report-bug-btn")) {
+    const bugBtn = document.createElement("a");
+    bugBtn.href = BUG_REPORT_URL;
+    bugBtn.target = "_blank";
+    bugBtn.rel = "noopener";
+    bugBtn.className = "rpgx-report-bug-btn";
+    bugBtn.innerHTML = `<i class="fa-solid fa-bug"></i> Report a Bug`;
+    infoGroup.appendChild(bugBtn);
+  }
+
+  // 4. Ethical AI card, appended once at the bottom of this module's settings
+  const allGroups = Array.from(root.querySelectorAll(".form-group"));
+  const ourGroups = allGroups.filter(g =>
+    g.querySelector(`[name^="${MODULE_ID}."]`) || g.querySelector(".rpgx-report-bug-btn")
+  );
+  const lastGroup = ourGroups[ourGroups.length - 1];
+
+  if (lastGroup && !root.querySelector(".rpgx-ethics-card")) {
+    const card = document.createElement("div");
+    card.className = "rpgx-ethics-card";
+    card.innerHTML = `
+      <div class="rpgx-ethics-header">
+        <i class="fa-solid fa-leaf"></i>
+        <strong>Our Commitment to Ethical AI</strong>
+      </div>
+      <p>RPGX tools use local AI models that run entirely on your own hardware. Your game data, story content, and player information never leave your machine.</p>
+      <p>We believe AI should assist human creativity, not replace it. Every quest, every story beat, every world detail is yours. The AI is just here to help you bring it to life faster.</p>
+      <p class="rpgx-ethics-footer-note">RPGX Studios does not partner with or endorse AI platforms that harvest user data, exploit creator work without consent, or undermine human rights.</p>
+    `;
+    lastGroup.insertAdjacentElement("afterend", card);
+  }
+}
+
+for (const hookName of ["renderSettingsConfig", "renderPackageConfiguration", "renderSettings", "renderApplicationV2"]) {
+  Hooks.on(hookName, (_app, html) => {
+    const root = html instanceof HTMLElement ? html : html?.[0];
+    if (!root) return;
+    enhanceShopsSettings(root);
+  });
+}
+
+Hooks.once("ready", () => {
+  const observer = new MutationObserver(() => {
+    const root = document.querySelector(".settings-list") ?? document.body;
+    enhanceShopsSettings(root);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+});
+
+/* -------------------------------------------- */
+/* Floating GM button                            */
+/* -------------------------------------------- */
+
+// Position is controlled entirely by #rpgx-shops-floating-button in
+// styles/rpgx-shops.css (bottom / left). Edit those values to nudge it,
+// nothing here sets inline styles, so CSS edits will always take effect.
+
+function createFloatingButton() {
+  if (document.getElementById("rpgx-shops-floating-button")) return;
+
+  const button = document.createElement("button");
+  button.id = "rpgx-shops-floating-button";
+  button.type = "button";
+  button.title = "RPGX Shops & Traders";
+  button.innerHTML = `<i class="fa-solid fa-cart-shopping"></i>`;
+  button.addEventListener("click", () => new ShopsMainMenu().render(true));
+
+  document.body.appendChild(button);
+}

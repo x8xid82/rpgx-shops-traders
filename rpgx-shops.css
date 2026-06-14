@@ -1,0 +1,323 @@
+import { MODULE_ID } from "./currency.js";
+import { protonStatus } from "./ai.js";
+
+export const BUSINESS_FLAG = "isBusiness";
+export const DATA_FLAG = "data";
+
+// The "core.sheetClass" flag value that points a business actor's sheet at
+// ShopWindowSheet, so double-clicking its token on the canvas opens the
+// Shop window instead of a normal NPC sheet.
+export const SHOP_SHEET_ID = `${MODULE_ID}.ShopWindowSheet`;
+
+/** Make sure a business actor's sheet is set to the Shop window. Safe to call repeatedly. */
+export async function ensureShopSheet(actor) {
+  if (actor.getFlag("core", "sheetClass") !== SHOP_SHEET_ID) {
+    await actor.setFlag("core", "sheetClass", SHOP_SHEET_ID);
+  }
+}
+
+// Free tier cap. The Shop window (Phase 2) adds the matching 10-item cap per business.
+export const FREE_BUSINESS_LIMIT = 3;
+
+export const BUSINESS_FOLDER_NAME = "Businesses";
+export const DEFAULT_INVENTORY_SETTING = "defaultInventoryLists";
+
+// Default portrait + token image for new business actors. Ships with the
+// module so it's always available, even on a fresh install.
+export const DEFAULT_SHOP_ICON = `modules/${MODULE_ID}/images/shop-icon.png`;
+
+/** Get the GM's saved default inventory lists (each: { id, name, isDefault, items }). */
+export function getDefaultInventoryLists() {
+  return game.settings.get(MODULE_ID, DEFAULT_INVENTORY_SETTING) ?? [];
+}
+
+/** Persist the GM's default inventory lists. */
+export async function setDefaultInventoryLists(lists) {
+  await game.settings.set(MODULE_ID, DEFAULT_INVENTORY_SETTING, lists);
+}
+
+/**
+ * Find the top-level "Businesses" Actor folder, creating it if it
+ * doesn't exist yet.
+ */
+async function getOrCreateBusinessFolder() {
+  let folder = game.folders.find(
+    f => f.type === "Actor" && f.name === BUSINESS_FOLDER_NAME && !f._source.folder
+  );
+
+  if (!folder) {
+    folder = await Folder.create({
+      name: BUSINESS_FOLDER_NAME,
+      type: "Actor",
+      color: "#d4a944"
+    });
+  }
+
+  return folder;
+}
+
+/**
+ * Find or create the folder a business should live in: a subfolder
+ * named after its Location, nested inside "Businesses". If no location
+ * is set, the business goes directly in "Businesses".
+ */
+export async function getOrCreateBusinessLocationFolder(location) {
+  const businessFolder = await getOrCreateBusinessFolder();
+  const locationName = location?.trim();
+
+  if (!locationName) return businessFolder;
+
+  let folder = game.folders.find(
+    f => f.type === "Actor" && f.name === locationName && f._source.folder === businessFolder.id
+  );
+
+  if (!folder) {
+    folder = await Folder.create({
+      name: locationName,
+      type: "Actor",
+      folder: businessFolder.id,
+      color: "#d4a944"
+    });
+  }
+
+  return folder;
+}
+
+/**
+ * Move a business actor into the folder matching the given location,
+ * creating that folder if needed. Call this after a business's Location
+ * is edited so its place in the Actors directory stays in sync. Does
+ * nothing if the actor is already in the right folder.
+ */
+export async function refileBusinessToLocation(actor, location) {
+  const folder = await getOrCreateBusinessLocationFolder(location);
+  if (actor.folder?.id !== folder.id) {
+    await actor.update({ folder: folder.id });
+  }
+}
+
+/**
+ * Tier check used everywhere else in this module.
+ *
+ * TEMPORARY: Quest Log's validateSubscription() also pings Proton's
+ * /api/subscription endpoint to confirm an active Patreon sub, but that
+ * endpoint is still marked TODO even there. Until it's finalized, "Proton
+ * is reachable" is treated as Pro access so AI generation is testable.
+ * Once /api/subscription is confirmed, swap the line below for the real
+ * check, everything downstream already just calls isProUser().
+ */
+export function isProUser() {
+  return protonStatus.detected;
+}
+
+/** Get every Actor in the world flagged as an RPGX business. */
+export function getAllBusinesses() {
+  return game.actors.filter(a => a.getFlag(MODULE_ID, BUSINESS_FLAG));
+}
+
+/** Get a single business Actor by id, or null if it isn't a business. */
+export function getBusiness(actorId) {
+  const actor = game.actors.get(actorId);
+  if (!actor?.getFlag(MODULE_ID, BUSINESS_FLAG)) return null;
+  return actor;
+}
+
+/** Can the GM create another business under the current tier? */
+export function canCreateBusiness() {
+  return isProUser() || getAllBusinesses().length < FREE_BUSINESS_LIMIT;
+}
+
+/**
+ * Read the RPGX-specific data stored on a business actor, filled in with
+ * defaults for anything not yet set.
+ */
+export function getBusinessData(actor) {
+  return foundry.utils.mergeObject(
+    {
+      businessType: "",
+      location: "",
+      description: "",
+      otherNotes: "",
+      shopkeepers: [], // array of Actor UUIDs (NPCs that exist independently)
+      activeShopkeeper: null, // Actor UUID of the NPC currently shown in the shop window
+      services: [], // array of { id, name, cost } - cost is in base currency units (e.g. gp)
+      buybackRate: null, // null = use the world default
+      haggleModifier: 0, // percent, applied live across the whole shop
+      activeSession: null // { userId, userName, startedAt } - who is currently shopping
+    },
+    actor.getFlag(MODULE_ID, DATA_FLAG) ?? {},
+    { inplace: false }
+  );
+}
+
+/** Create a new business actor with the given starting data. */
+export async function createBusiness({ name, businessType, location, description, otherNotes, shopkeepers, buybackRate, startingInventoryId }) {
+  const folder = await getOrCreateBusinessLocationFolder(location);
+
+  const actor = await Actor.create({
+    name: name || "New Business",
+    type: "npc",
+    img: DEFAULT_SHOP_ICON,
+    prototypeToken: {
+      texture: { src: DEFAULT_SHOP_ICON }
+    },
+    folder: folder?.id ?? null,
+    // Players need at least Observer access to view shop inventory in the
+    // Shop window. They still can't edit the actor directly, purchases and
+    // sales are relayed through a GM client (see socket.js).
+    ownership: {
+      default: CONST.DOCUMENT_OWNERSHIP_LEVELS.OBSERVER
+    }
+  });
+
+  await actor.setFlag(MODULE_ID, BUSINESS_FLAG, true);
+  await ensureShopSheet(actor);
+  await actor.setFlag(MODULE_ID, DATA_FLAG, {
+    businessType: businessType ?? "",
+    location: location ?? "",
+    description: description ?? "",
+    otherNotes: otherNotes ?? "",
+    shopkeepers: shopkeepers ?? [],
+    activeShopkeeper: null,
+    services: [],
+    buybackRate: buybackRate ?? null,
+    haggleModifier: 0,
+    activeSession: null
+  });
+
+  if (startingInventoryId) {
+    const list = getDefaultInventoryLists().find(l => l.id === startingInventoryId);
+    if (list?.items?.length) {
+      const itemsData = list.items.map(item => {
+        const data = foundry.utils.deepClone(item);
+        delete data._id;
+        return data;
+      });
+      await actor.createEmbeddedDocuments("Item", itemsData);
+    }
+  }
+
+  return actor;
+}
+
+/** Update the RPGX data on an existing business actor (merges with existing data). */
+export async function updateBusinessData(actor, changes) {
+  const current = getBusinessData(actor);
+  const merged = foundry.utils.mergeObject(current, changes, { inplace: false });
+  await actor.setFlag(MODULE_ID, DATA_FLAG, merged);
+  return merged;
+}
+
+/** Delete a business actor entirely. */
+export async function deleteBusiness(actor) {
+  await actor.delete();
+}
+
+/* ===================================================== */
+/* Active shopkeeper                                      */
+/* ===================================================== */
+
+/**
+ * Get the NPC shopkeeper currently shown in this business's shop window.
+ *
+ * If a valid choice is already saved, everyone sees that. If not, a random
+ * pick is made, GM clients persist it (so every viewer converges on the
+ * same NPC from then on), players just use it locally for this render,
+ * since they don't have permission to write to the business actor. This
+ * self-corrects the next time a GM has the shop open.
+ */
+export async function getActiveShopkeeper(actor) {
+  const data = getBusinessData(actor);
+  const pool = data.shopkeepers ?? [];
+  if (!pool.length) return null;
+
+  let uuid = data.activeShopkeeper;
+  const needsPick = !uuid || !pool.includes(uuid);
+
+  if (needsPick) {
+    uuid = pool[Math.floor(Math.random() * pool.length)];
+    if (game.user.isGM) await updateBusinessData(actor, { activeShopkeeper: uuid });
+  }
+
+  const npc = fromUuidSync(uuid);
+  if (!npc) return null;
+  return { uuid: npc.uuid, name: npc.name, img: npc.img };
+}
+
+/** GM action: roll a different shopkeeper than the one currently shown. */
+export async function rerollShopkeeper(actor) {
+  const data = getBusinessData(actor);
+  const pool = data.shopkeepers ?? [];
+  if (!pool.length) return null;
+
+  const others = pool.filter(uuid => uuid !== data.activeShopkeeper);
+  const choices = others.length ? others : pool;
+  const uuid = choices[Math.floor(Math.random() * choices.length)];
+  await updateBusinessData(actor, { activeShopkeeper: uuid });
+
+  const npc = fromUuidSync(uuid);
+  return npc ? { uuid: npc.uuid, name: npc.name, img: npc.img } : null;
+}
+
+/* ===================================================== */
+/* Services                                               */
+/* ===================================================== */
+
+/** Add a service (e.g. "Basic Room", cost 5) to a business. */
+export async function addService(actor, { name, cost }) {
+  const data = getBusinessData(actor);
+  const service = { id: foundry.utils.randomID(), name: (name ?? "").trim() || "Service", cost: Number(cost) || 0 };
+  await updateBusinessData(actor, { services: [...data.services, service] });
+  return service;
+}
+
+/** Update a service by id (name and/or cost). */
+export async function updateService(actor, serviceId, changes) {
+  const data = getBusinessData(actor);
+  const services = data.services.map(s => (s.id === serviceId ? { ...s, ...changes } : s));
+  await updateBusinessData(actor, { services });
+}
+
+/** Remove a service by id. */
+export async function removeService(actor, serviceId) {
+  const data = getBusinessData(actor);
+  const services = data.services.filter(s => s.id !== serviceId);
+  await updateBusinessData(actor, { services });
+}
+
+/* ===================================================== */
+/* Per-item stock flags (unlimited stock + restock level) */
+/* ===================================================== */
+
+export const ITEM_UNLIMITED_FLAG = "unlimited";
+export const ITEM_RESTOCK_FLAG = "restockQuantity";
+
+/** Is this shop item flagged as having unlimited stock? */
+export function isItemUnlimited(item) {
+  return !!item.getFlag(MODULE_ID, ITEM_UNLIMITED_FLAG);
+}
+
+/** Toggle unlimited stock for a shop item. */
+export async function setItemUnlimited(item, unlimited) {
+  await item.setFlag(MODULE_ID, ITEM_UNLIMITED_FLAG, !!unlimited);
+}
+
+/**
+ * Reset every non-unlimited item in a business back to its restock level
+ * (the quantity it had when first added to the shop). Returns how many
+ * items were changed.
+ */
+export async function restockAll(actor) {
+  const updates = [];
+
+  for (const item of actor.items) {
+    if (isItemUnlimited(item)) continue;
+    const restock = item.getFlag(MODULE_ID, ITEM_RESTOCK_FLAG);
+    if (restock === undefined || restock === null) continue;
+    if ((item.system.quantity ?? 0) === restock) continue;
+    updates.push({ _id: item.id, "system.quantity": restock });
+  }
+
+  if (updates.length) await actor.updateEmbeddedDocuments("Item", updates);
+  return updates.length;
+}

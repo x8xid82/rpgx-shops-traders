@@ -1,0 +1,150 @@
+export const MODULE_ID = "rpgx-shops-traders";
+
+/**
+ * Default currency setups for common systems.
+ * "rate" = how many of the base unit (the cheapest practical "main" coin,
+ * gold for dnd5e/pf2e) one unit of this denomination is worth.
+ * The list does not need to be in order, getCurrencyConfig() sorts it.
+ */
+export const CURRENCY_PRESETS = {
+  dnd5e: [
+    { id: "pp", label: "Platinum", rate: 10 },
+    { id: "gp", label: "Gold", rate: 1 },
+    { id: "ep", label: "Electrum", rate: 0.5 },
+    { id: "sp", label: "Silver", rate: 0.1 },
+    { id: "cp", label: "Copper", rate: 0.01 }
+  ],
+  pf2e: [
+    { id: "pp", label: "Platinum", rate: 10 },
+    { id: "gp", label: "Gold", rate: 1 },
+    { id: "sp", label: "Silver", rate: 0.1 },
+    { id: "cp", label: "Copper", rate: 0.01 }
+  ],
+  generic: [
+    { id: "credits", label: "Credits", rate: 1 }
+  ]
+};
+
+/**
+ * Get the active currency configuration, sorted highest value first.
+ * GMs running a non dnd5e system can edit this list (currency settings
+ * menu is coming alongside the Shop window in Phase 2).
+ */
+export function getCurrencyConfig() {
+  const config = game.settings.get(MODULE_ID, "currencyConfig");
+  return [...config].sort((a, b) => b.rate - a.rate);
+}
+
+/** Convert an amount in a given denomination to base units (e.g. gp). */
+export function toBaseUnits(amount, denominationId) {
+  const config = getCurrencyConfig();
+  const denom = config.find(d => d.id === denominationId);
+  if (!denom) return amount;
+  return (amount ?? 0) * denom.rate;
+}
+
+/**
+ * Break a base-unit amount down into a denomination breakdown,
+ * largest denomination first. Used to show players "you owe 2pp 3gp 5sp".
+ */
+export function fromBaseUnits(baseAmount) {
+  const config = getCurrencyConfig();
+  const result = {};
+  let remaining = baseAmount;
+
+  for (const denom of config) {
+    const count = Math.floor((remaining / denom.rate) + 1e-9);
+    result[denom.id] = count;
+    remaining = Math.round((remaining - (count * denom.rate)) * 1e6) / 1e6;
+  }
+
+  return result;
+}
+
+/** Format a base-unit amount as a readable string, e.g. "2pp 3gp 5sp". */
+export function formatCurrency(baseAmount) {
+  const breakdown = fromBaseUnits(baseAmount);
+  const parts = [];
+
+  for (const [id, count] of Object.entries(breakdown)) {
+    if (count > 0) parts.push(`${count}${id}`);
+  }
+
+  if (parts.length) return parts.join(" ");
+
+  const smallest = getCurrencyConfig().slice(-1)[0];
+  return `0${smallest?.id ?? ""}`;
+}
+
+/**
+ * Format a base-unit amount the way most tables actually talk about money:
+ * gold is the highest denomination shown, platinum and electrum are
+ * skipped even if the currency config includes them, since most groups
+ * price things in gp/sp/cp and don't think in pp or ep day to day.
+ * Amounts under 1gp fall through to silver and copper, e.g. "1000gp",
+ * "5sp", "2sp 8cp", "0gp". A character's actual coin purse
+ * (formatCurrency/adjustActorCurrency) still uses the full denomination
+ * set, this only affects how prices and totals are displayed.
+ */
+export function formatBaseUnit(baseAmount) {
+  const config = getCurrencyConfig().filter(d => d.rate <= 1 && d.id !== "ep");
+  if (!config.length) return formatCurrency(baseAmount);
+
+  const parts = [];
+  let remaining = baseAmount ?? 0;
+
+  for (const denom of config) {
+    const count = Math.floor((remaining / denom.rate) + 1e-9);
+    if (count > 0) parts.push(`${count}${denom.id}`);
+    remaining = Math.round((remaining - count * denom.rate) * 1e6) / 1e6;
+  }
+
+  if (parts.length) return parts.join(" ");
+
+  const base = config.find(d => d.rate === 1) ?? config[0];
+  return `0${base?.id ?? ""}`;
+}
+
+/**
+ * Read an item's price and convert it to base units.
+ * Handles the common { value, denomination } shape used by dnd5e and pf2e,
+ * and falls back to a plain number if the system stores price that way.
+ */
+export function getItemPriceInBase(item) {
+  const price = item?.system?.price;
+  if (!price) return 0;
+
+  if (typeof price === "object" && "value" in price) {
+    const denom = price.denomination || getCurrencyConfig().slice(-1).reverse()[0]?.id || "gp";
+    return toBaseUnits(price.value ?? 0, denom);
+  }
+
+  if (typeof price === "number") return price;
+
+  return 0;
+}
+
+/**
+ * Get an actor's total currency converted to base units.
+ * Used to show "you have X gp" and to check if a player can afford their cart.
+ */
+export function getActorFundsInBase(actor) {
+  const currency = actor?.system?.currency;
+  if (!currency) return 0;
+
+  let total = 0;
+  for (const [denomId, amount] of Object.entries(currency)) {
+    total += toBaseUnits(amount ?? 0, denomId);
+  }
+
+  return total;
+}
+
+/**
+ * Apply a haggle percentage modifier to a base-unit amount.
+ * +10 = 10% more expensive, -15 = 15% cheaper. Never goes below 0.
+ */
+export function applyHaggle(baseAmount, modifierPercent) {
+  const result = (baseAmount ?? 0) * (1 + (modifierPercent ?? 0) / 100);
+  return Math.max(0, result);
+}

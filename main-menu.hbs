@@ -1,0 +1,153 @@
+import { MODULE_ID, getItemPriceInBase, getActorFundsInBase, fromBaseUnits, formatBaseUnit, applyHaggle } from "./currency.js";
+import { getBusiness, getBusinessData, isItemUnlimited } from "./business.js";
+
+/**
+ * Apply a net currency change (in base units, e.g. gp) to an actor.
+ *
+ * Converts the actor's whole purse to base units, applies the delta, then
+ * re-mints the result back into denominations via fromBaseUnits(). This is
+ * what makes "auto convert everything to gp" possible without tracking
+ * fractional coins, an actor's coin breakdown may look different after a
+ * transaction (e.g. 17sp becomes 1gp 7sp), but the total value is correct.
+ */
+export async function adjustActorCurrency(actor, deltaBase) {
+  if (Math.abs(deltaBase) < 1e-9) return;
+
+  const currentBase = getActorFundsInBase(actor);
+  const newBase = Math.max(0, currentBase + deltaBase);
+  const breakdown = fromBaseUnits(newBase);
+
+  const updates = {};
+  for (const [denomId, amount] of Object.entries(breakdown)) {
+    updates[`system.currency.${denomId}`] = amount;
+  }
+
+  await actor.update(updates);
+}
+
+/**
+ * Add item data onto an actor. If an item with the same name and type
+ * already exists, its quantity is increased instead of creating a
+ * duplicate stack. This is how sold loot returns to a shop's shelves
+ * without piling up duplicate entries.
+ */
+export async function mergeItemsIntoActor(actor, itemsData) {
+  for (const data of itemsData) {
+    const qty = data.system?.quantity ?? 1;
+    const existing = actor.items.find(i => i.name === data.name && i.type === data.type);
+
+    if (existing) {
+      const current = existing.system?.quantity ?? 0;
+      await existing.update({ "system.quantity": current + qty });
+    } else {
+      await actor.createEmbeddedDocuments("Item", [data]);
+    }
+  }
+}
+
+/**
+ * Run a full shop transaction: buy items from the shop, sell items to the
+ * shop, and pay for services, all in one pass. This always needs to run on
+ * a client with permission to edit both the business actor and the
+ * shopper's actor, in practice that means a GM client (see socket.js for
+ * how player requests get relayed to one).
+ *
+ * @param {object} params
+ * @param {string} params.businessId
+ * @param {string} params.actorId   - the shopper's character
+ * @param {Array}  [params.purchases] - [{ itemId, qty }] items on the shop actor
+ * @param {Array}  [params.sales]     - [{ itemId, qty }] items on the shopper's actor
+ * @param {Array}  [params.services]  - [{ id, qty }] service ids from the business's services list
+ * @returns {{ netCostBase: number, costBase: number, creditBase: number }}
+ */
+export async function processTransaction({ businessId, actorId, purchases = [], sales = [], services = [] }) {
+  const business = getBusiness(businessId);
+  const actor = game.actors.get(actorId);
+  if (!business) throw new Error("This shop no longer exists.");
+  if (!actor) throw new Error("Character not found.");
+
+  const data = getBusinessData(business);
+  const modifier = data.haggleModifier ?? 0;
+  const buybackRate = (data.buybackRate ?? game.settings.get(MODULE_ID, "defaultBuybackRate") ?? 50) / 100;
+
+  let costBase = 0;
+  let creditBase = 0;
+
+  // --- Purchases: shop stock -> shopper's inventory ---
+  const shopDecrements = [];
+  const itemsForShopper = [];
+
+  for (const { itemId, qty: requested } of purchases) {
+    const shopItem = business.items.get(itemId);
+    if (!shopItem || requested <= 0) continue;
+
+    const unlimited = isItemUnlimited(shopItem);
+    const available = shopItem.system.quantity ?? 0;
+    const qty = unlimited ? requested : Math.min(requested, available);
+    if (qty <= 0) continue;
+
+    costBase += applyHaggle(getItemPriceInBase(shopItem), modifier) * qty;
+
+    if (!unlimited) shopDecrements.push({ _id: shopItem.id, "system.quantity": available - qty });
+
+    const itemData = shopItem.toObject();
+    delete itemData._id;
+    itemData.system.quantity = qty;
+    itemsForShopper.push(itemData);
+  }
+
+  // --- Sales: shopper's inventory -> shop stock ---
+  const shopperRemovals = [];
+  const shopperDecrements = [];
+  const itemsForShop = [];
+
+  for (const { itemId, qty: requested } of sales) {
+    const shopperItem = actor.items.get(itemId);
+    if (!shopperItem || requested <= 0) continue;
+
+    const available = shopperItem.system.quantity ?? 1;
+    const qty = Math.min(requested, available);
+    if (qty <= 0) continue;
+
+    creditBase += applyHaggle(getItemPriceInBase(shopperItem) * buybackRate, modifier) * qty;
+
+    if (qty >= available) shopperRemovals.push(shopperItem.id);
+    else shopperDecrements.push({ _id: shopperItem.id, "system.quantity": available - qty });
+
+    const itemData = shopperItem.toObject();
+    delete itemData._id;
+    itemData.system.quantity = qty;
+    itemsForShop.push(itemData);
+  }
+
+  // --- Services: flat charges, nothing to track in stock ---
+  for (const { id, qty } of services) {
+    const service = data.services.find(s => s.id === id);
+    if (!service || qty <= 0) continue;
+    costBase += applyHaggle(service.cost, modifier) * qty;
+  }
+
+  const netCostBase = costBase - creditBase;
+
+  // --- Funds check, only matters if the shopper owes money ---
+  if (netCostBase > 0) {
+    const funds = getActorFundsInBase(actor);
+    if (funds + 1e-6 < netCostBase) {
+      throw new Error(
+        `Not enough funds. This costs ${formatBaseUnit(netCostBase)}, but ${actor.name} only has ${formatBaseUnit(funds)}.`
+      );
+    }
+  }
+
+  // --- Apply everything ---
+  if (shopDecrements.length) await business.updateEmbeddedDocuments("Item", shopDecrements);
+  if (itemsForShop.length) await mergeItemsIntoActor(business, itemsForShop);
+
+  if (shopperRemovals.length) await actor.deleteEmbeddedDocuments("Item", shopperRemovals);
+  if (shopperDecrements.length) await actor.updateEmbeddedDocuments("Item", shopperDecrements);
+  if (itemsForShopper.length) await mergeItemsIntoActor(actor, itemsForShopper);
+
+  await adjustActorCurrency(actor, -netCostBase);
+
+  return { netCostBase, costBase, creditBase };
+}
